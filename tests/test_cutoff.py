@@ -221,5 +221,120 @@ check("window: 02:00 整点（非严格晚于）仍属前一营业日", e2["busi
 e3 = add_line(33.0, "2026-11-22T23:59:00Z")
 check("window: 23:59 归 22 日", e3["business_day"], "2026-11-22")
 
+
+# ---------- 场景五：三夹具流水/预览/批次互证（同源收口回归） ----------
+print("\n== 场景五：三夹具流水 · 预览 · 批次互证 ==")
+
+
+def db_line(line_no: str) -> dict:
+    conn = connect()
+    row = conn.execute("SELECT * FROM cash_lines WHERE line_no=?", (line_no,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def db_late_flag_count(day: str) -> int:
+    conn = connect()
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM cash_lines WHERE business_day=? AND late_flag=1", (day,)
+    ).fetchone()["c"]
+    conn.close()
+    return int(n)
+
+
+def batch_of(day: str) -> dict:
+    return [x for x in batches() if x["business_day"] == day][0]
+
+
+# 夹具一：过点仍归当日且假晚到（roll 策略下绝不允许 late_flag 与归属日互相拆台）
+print("-- 夹具一：过点仍归当日且假晚到 --")
+set_day("2026-11-23")
+set_cutoff("02:00", "roll_to_next_day")
+fx1 = add_line(55.0, "2026-11-24T03:00:00Z")  # 严格晚于 cutoff
+# 流水：落库即次日、不打晚到
+check("夹具一-流水: 过点行落库次日且无假晚到", (fx1["business_day"], fx1["late_flag"]), ("2026-11-24", 0))
+check("夹具一-流水: 库内 business_day/late_flag 与响应一致",
+      (db_line(fx1["line_no"])["business_day"], db_line(fx1["line_no"])["late_flag"]),
+      ("2026-11-24", 0))
+# 预览：当日无该笔、晚到为 0；次日承接且晚到为 0
+pv23 = preview("2026-11-23")
+check("夹具一-预览: 当日预览不吞过点行且无假晚到",
+      (pv23["line_count"], round(pv23["system_total"], 2), pv23["late_count"]), (0, 0.0, 0))
+pv24 = preview("2026-11-24")
+check("夹具一-预览: 次日预览承接且晚到为 0",
+      (pv24["line_count"], round(pv24["system_total"], 2), pv24["late_count"]), (1, 55.0, 0))
+# 批次：封当日账，快照晚到为 0，与预览/流水互证
+b23 = seal("2026-11-23", 0.0)
+check("夹具一-批次: 当日封账不含过点行、晚到快照为 0",
+      (round(b23["system_total"], 2), b23["line_count"], b23["late_count"]), (0.0, 0, 0))
+check("夹具一-互证: 全库无 late_flag=1（roll 策略不产生晚到）", db_late_flag_count("2026-11-23"), 0)
+
+
+# 夹具二：应次日进了当日合计（过点行必须被当日封账合计排除）
+print("-- 夹具二：应次日进了当日合计 --")
+set_day("2026-11-25")
+set_cutoff("02:00", "roll_to_next_day")
+ok25 = add_line(100.0, "2026-11-25T20:00:00Z")   # cutoff 前，归当日
+late25 = add_line(70.0, "2026-11-26T02:30:00Z")  # 过点，规则归属次日 26
+check("夹具二-流水: 正常行归当日/过点行归次日",
+      (ok25["business_day"], late25["business_day"], late25["late_flag"]),
+      ("2026-11-25", "2026-11-26", 0))
+# 预览：当日合计只含 100，不含本应次日的 70
+pv25 = preview("2026-11-25")
+check("夹具二-预览: 应次日行未混入当日合计",
+      (pv25["line_count"], round(pv25["system_total"], 2)), (1, 100.0))
+# 批次：封账合计=100（若混入 70 即为撒谎），且晚到 0；批次行与预览完全一致
+sealed25 = seal("2026-11-25", 100.0)
+check("夹具二-批次: 封账合计排除次日行",
+      (round(sealed25["system_total"], 2), sealed25["line_count"], sealed25["late_count"]),
+      (100.0, 1, 0))
+pv25_after = preview("2026-11-25")
+check("夹具二-互证: 已封日预览 == 冻结批次（合计/笔数/晚到）",
+      (round(pv25_after["system_total"], 2), pv25_after["line_count"], pv25_after["late_count"]),
+      (round(sealed25["system_total"], 2), sealed25["line_count"], sealed25["late_count"]))
+check("夹具二-互证: 已封日预览回传批次冻结的 cutoff 配置",
+      (pv25_after["cutoff_time"], pv25_after["cutoff_policy"]),
+      (sealed25["cutoff_time"], sealed25["cutoff_policy"]))
+
+
+# 夹具三：改 cutoff 动已封批（已 sealed 批次的合计与晚到快照不得被新 cutoff 篡改）
+print("-- 夹具三：改 cutoff 动已封批 --")
+set_day("2026-11-27")
+set_cutoff("02:00", "mark_late")
+c1 = add_line(200.0, "2026-11-27T12:00:00Z")   # 正常
+c2 = add_line(40.0, "2026-11-28T03:00:00Z")    # mark_late 下钉当日打晚到
+check("夹具三-流水: mark_late 晚到行钉当日且 late_flag=1",
+      (c1["business_day"], c2["business_day"], c2["late_flag"]), ("2026-11-27", "2026-11-27", 1))
+sealed27 = seal("2026-11-27", 240.0)
+check("夹具三-批次: 封账快照含晚到 1 笔 40",
+      (round(sealed27["system_total"], 2), sealed27["line_count"],
+       sealed27["late_count"], round(sealed27["late_total"], 2)),
+      (240.0, 2, 1, 40.0))
+
+# 大改 cutoff 时刻并切换策略（全局生效）
+set_cutoff("05:00", "roll_to_next_day")
+# 新口径下 03:00 仍会落到已封账的 27 日 -> 写闸按规则归属日拦截，钻不进旧批次
+check("夹具三-写闸: 新口径落到已封日被拦截(409)",
+      post_line_raw(999.0, "2026-11-28T03:00:00Z"), 409)
+
+frozen = batch_of("2026-11-27")
+check("夹具三-批次: 改 cutoff 后已封合计不被篡改", round(frozen["system_total"], 2), 240.0)
+check("夹具三-批次: 改 cutoff 后晚到笔数不被改写", frozen["late_count"], 1)
+check("夹具三-批次: 改 cutoff 后晚到金额不被改写", round(frozen["late_total"], 2), 40.0)
+check("夹具三-批次: 已封批冻结旧 cutoff 配置不回溯",
+      (frozen["cutoff_time"], frozen["cutoff_policy"]), ("02:00", "mark_late"))
+# 已封日预览仍读旧快照，即使全局已是 05:00/roll
+pv27 = preview("2026-11-27")
+check("夹具三-互证: 已封预览与冻结批次完全一致且不随全局配置漂移",
+      (round(pv27["system_total"], 2), pv27["late_count"], round(pv27["late_total"], 2),
+       pv27["cutoff_time"], pv27["cutoff_policy"]),
+      (240.0, 1, 40.0, "02:00", "mark_late"))
+# 既有晚到行不被回溯改写；roll 策略下的新写入也不会再产生 late_flag
+check("夹具三-流水: 既有 late_flag 不回溯", db_line(c2["line_no"])["late_flag"], 1)
+set_day("2026-11-28")
+new28 = add_line(15.0, "2026-11-28T10:00:00Z")
+check("夹具三-流水: 切 roll 后新写入 late_flag 恒为 0", new28["late_flag"], 0)
+
+
 print("\n" + ("全部通过" if not failures else f"失败 {len(failures)} 项: {failures}"))
 sys.exit(1 if failures else 0)

@@ -11,6 +11,18 @@ def is_sealed(conn: sqlite3.Connection, business_day: str) -> bool:
     return row is not None
 
 
+def get_sealed_batch(conn: sqlite3.Connection, business_day: str) -> dict[str, Any] | None:
+    """取某营业日当前生效的封账批次（status=sealed）；无则 None。
+
+    已封日的对外口径一律以该冻结快照为准，禁止再用实时聚合覆盖。
+    """
+    row = conn.execute(
+        "SELECT * FROM close_batches WHERE business_day=? AND status='sealed' LIMIT 1",
+        (business_day,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def next_batch_no(conn: sqlite3.Connection) -> str:
     n = conn.execute("SELECT COUNT(*) c FROM close_batches").fetchone()["c"] + 1
     return f"CB-{n:04d}"

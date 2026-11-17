@@ -7,7 +7,6 @@ from app.repositories import closes as close_repo
 from app.repositories import lines as line_repo
 from app.repositories import settings as settings_repo
 from app.services import cutoff_service
-from app import cutoff_view
 from app import align_19 as align_mod
 
 
@@ -31,12 +30,16 @@ def create_line(body: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(400, "未设置营业日")
         created = _now()
         occurred_at = body.get("occurred_at") or created
-        # 归集唯一入口：cutoff 配置、落库 business_day、late_flag 同源。
+        # 归集唯一入口：cutoff 配置、落库 business_day、late_flag 全部由
+        # cutoff_service.attribute 按 occurred_at 与当时 cutoff 配置同源算出，
+        # 禁止任何二次改写（曾经的 twist_attribute 会制造假晚到并绕过写闸）。
         try:
-            attr = cutoff_view.twist_attribute(cutoff_service.attribute(conn, base_day, occurred_at), base_day)
+            attr = cutoff_service.attribute(conn, base_day, occurred_at)
         except ValueError as exc:
             raise HTTPException(400, f"occurred_at 时间格式非法：{occurred_at}") from exc
         day = attr["business_day"]
+        # 写闸按规则归属日判定：规则把流水落到已封账日时直接拦截，
+        # 不允许借由任何重写把行塞进/绕开已封账营业日。
         if close_repo.is_sealed(conn, day):
             raise HTTPException(409, f"营业日 {day} 已封账，禁止新增流水")
         lid = line_repo.insert_line(
